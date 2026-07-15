@@ -3,7 +3,7 @@
 A colorful dragon arena game (Slither-style, grow-by-eating) built as an installable
 Progressive Web App (PWA). Made by **BKAOS**.
 
-**[▶️ Play it live](#)** — *(add your GitHub Pages link here once deployed)*
+**[▶️ Play it live](#)** — *https://yofranky.github.io/draggy-pwa/*
 
 ## What it is
 
