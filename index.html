@@ -1,0 +1,1280 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="Draggy">
+<meta name="theme-color" content="#FF595E">
+<meta name="color-scheme" content="dark">
+<meta name="description" content="Draggy — a privacy-first dragon arena game by BKAOS. No accounts, no tracking, no ads.">
+<link rel="manifest" href="manifest.json">
+<link rel="apple-touch-icon" href="assets/icons/apple-touch-icon.png">
+<link rel="icon" type="image/png" sizes="192x192" href="assets/icons/icon-192.png">
+<title>Draggy</title>
+<!--
+  ARCHITECTURE NOTES (maps to the original game-design brief)
+  ------------------------------------------------------------
+  A. StateManager        -> see "MODULE A" below (menu/settings/playing/paused/gameover)
+  B. DragonController     -> see "MODULE B" (base class + PlayerDragonController + AIDragonController)
+  C. Segment Follower     -> DragonController.getSpacedPoints() — arc-length resampling so tail
+                             segments never gap or overlap, even mid-boost (variable speed).
+  D. Object Pooling       -> EssencePool reuses orb objects instead of allocating/freeing every
+                             frame. Tail points are NOT pooled — there are only ever a few dozen
+                             of them and re-allocating plain {x,y} objects for them is cheap; the
+                             orb pool is where pooling actually pays off (150+ short-lived objects).
+
+  NO NETWORK CALLS ANYWHERE in this file on purpose: no analytics, no font CDN, no ping-back of
+  scores or device info. Settings persist only in memory for this session — wire the STORAGE
+  adapter below to Capacitor Preferences / UserDefaults / localStorage in the native shell if you
+  want settings to survive a relaunch.
+
+  PWA NOTES
+  ------------------------------------------------------------
+  This app is installable and works offline via sw.js (cache-first, registered at the bottom of
+  the script below). Manifest + icons live in ./manifest.json and ./assets/icons/.
+-->
+<style>
+  :root {
+    --safe-top: env(safe-area-inset-top);
+    --safe-bottom: env(safe-area-inset-bottom);
+    --accent: #FF595E;
+    --accent-2: #FFCA3A;
+    --game-bg: #0B061F;
+    --panel: rgba(255,255,255,0.08);
+    --panel-strong: rgba(255,255,255,0.16);
+    --ui-scale: 1;
+    --display-font: -apple-system, ui-rounded, "SF Pro Rounded", "Segoe UI", Roboto, system-ui, sans-serif;
+    --body-font: -apple-system, system-ui, "Segoe UI", Roboto, sans-serif;
+  }
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; user-select: none; -webkit-touch-callout: none; }
+  html, body {
+    margin: 0; padding: 0; width: 100%; height: 100%; overflow: hidden;
+    position: fixed; touch-action: none;
+    font-family: var(--body-font);
+    background: var(--game-bg); color: #fff;
+  }
+  #app { width: 100%; height: 100%; position: relative; }
+
+  .visually-hidden {
+    position: absolute; width: 1px; height: 1px; overflow: hidden;
+    clip: rect(0 0 0 0); white-space: nowrap;
+  }
+
+  /* SCREENS */
+  .screen {
+    position: absolute; inset: 0; z-index: 100;
+    display: flex; flex-direction: column; align-items: center; justify-content: center;
+    padding: calc(var(--safe-top) + 1rem) 1.5rem calc(var(--safe-bottom) + 1rem);
+    overflow-y: auto;
+  }
+  .hidden { display: none !important; }
+
+  #screen-main, #screen-settings { background: linear-gradient(135deg, #1A0B36 0%, #0B061F 100%); }
+
+  .logo-text {
+    font-family: var(--display-font); font-weight: 800; font-size: 3rem; line-height: 1.1;
+    color: #fff; text-shadow: 0 6px 0 rgba(0,0,0,0.35);
+    text-align: center; margin-bottom: 1.5rem;
+  }
+  .logo-text span { color: var(--accent); }
+
+  .btn {
+    border: none; cursor: pointer; font-family: var(--display-font); font-weight: 800;
+    font-size: calc(1.15rem * var(--ui-scale)); color: #fff; padding: calc(0.9rem * var(--ui-scale)) 1.6rem;
+    margin: .4rem; width: 88%; max-width: 320px; min-height: 48px;
+    border-radius: 18px; background: var(--accent);
+    box-shadow: 0 6px 0 rgba(0,0,0,0.35), 0 8px 15px rgba(0,0,0,0.4);
+    transition: transform .05s, box-shadow .05s;
+  }
+  .btn:active { transform: translateY(4px); box-shadow: 0 2px 0 rgba(0,0,0,0.35); }
+  .btn.secondary { background: var(--panel-strong); }
+  .btn.ghost { background: transparent; box-shadow: none; color: rgba(255,255,255,0.7); font-size: 1rem; min-height: 40px; }
+  .btn:focus-visible, .icon-btn:focus-visible, .switch input:focus-visible + .track { outline: 3px solid #fff; outline-offset: 2px; }
+
+  /* SETTINGS PANEL */
+  .panel-card {
+    width: 100%; max-width: 380px; background: var(--panel); border-radius: 18px;
+    padding: 0.4rem 1rem; margin-bottom: 1rem;
+  }
+  .setting-row {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 0.85rem 0; border-bottom: 1px solid rgba(255,255,255,0.08);
+    gap: 0.75rem;
+  }
+  .setting-row:last-child { border-bottom: none; }
+  .setting-row .label-group { display: flex; flex-direction: column; }
+  .setting-row .label-group .title { font-weight: 800; font-size: calc(0.95rem * var(--ui-scale)); }
+  .setting-row .label-group .desc { font-size: 0.78rem; opacity: 0.6; margin-top: 2px; max-width: 220px; }
+
+  .switch { position: relative; display: inline-block; width: 52px; height: 30px; flex-shrink: 0; }
+  .switch input { opacity: 0; width: 0; height: 0; }
+  .switch .track {
+    position: absolute; inset: 0; background: rgba(255,255,255,0.2); border-radius: 30px; transition: .15s;
+  }
+  .switch .track::before {
+    content: ""; position: absolute; height: 24px; width: 24px; left: 3px; top: 3px;
+    background: #fff; border-radius: 50%; transition: .15s;
+  }
+  .switch input:checked + .track { background: var(--accent); }
+  .switch input:checked + .track::before { transform: translateX(22px); }
+
+  .segmented { display: flex; background: rgba(0,0,0,0.25); border-radius: 12px; padding: 3px; flex-shrink: 0; }
+  .segmented button {
+    border: none; background: transparent; color: rgba(255,255,255,0.65); font-family: var(--display-font);
+    font-weight: 800; font-size: 0.8rem; padding: 0.45rem 0.7rem; border-radius: 9px; min-height: 36px;
+  }
+  .segmented button.active { background: var(--accent); color: #fff; }
+
+  /* GAME HUD */
+  #hud {
+    position: absolute; top: 0; left: 0; width: 100%; z-index: 50;
+    padding: calc(var(--safe-top) + 12px) 16px 0 16px;
+    display: flex; justify-content: space-between; align-items: flex-start; pointer-events: none;
+  }
+  .hud-box {
+    background: rgba(255, 255, 255, 0.12); backdrop-filter: blur(4px);
+    border-radius: 14px; padding: 6px 14px; font-family: var(--display-font);
+  }
+  .hud-box .label { font-size: 0.65rem; opacity: 0.65; display: block; letter-spacing: 0.5px; }
+  .hud-box .value { font-size: calc(1.15rem * var(--ui-scale)); font-weight: 800; }
+  body.high-contrast .hud-box { background: rgba(0,0,0,0.7); border: 1px solid #fff; }
+
+  .icon-btn {
+    pointer-events: auto; width: 44px; height: 44px; border-radius: 50%; border: none;
+    background: rgba(255,255,255,0.14); color: #fff; font-size: 1.2rem;
+    display: flex; align-items: center; justify-content: center;
+  }
+
+  #gameCanvas { display: block; width: 100%; height: 100%; touch-action: none; }
+
+  /* ON-SCREEN CONTROLS */
+  #controls-layer { position: absolute; inset: 0; z-index: 40; pointer-events: none; }
+  #joystick-zone {
+    position: absolute; left: 24px; bottom: calc(var(--safe-bottom) + 28px);
+    width: 130px; height: 130px; border-radius: 50%;
+    background: rgba(255,255,255,0.08); border: 2px solid rgba(255,255,255,0.18);
+    pointer-events: auto; touch-action: none;
+  }
+  #joystick-knob {
+    position: absolute; width: 56px; height: 56px; border-radius: 50%;
+    background: rgba(255,255,255,0.45); left: 37px; top: 37px;
+  }
+  #boost-btn {
+    position: absolute; right: 24px; bottom: calc(var(--safe-bottom) + 28px);
+    width: 84px; height: 84px; border-radius: 50%; border: none;
+    background: var(--accent-2); color: #1A0B36; font-family: var(--display-font); font-weight: 800;
+    font-size: 0.95rem; box-shadow: 0 6px 0 rgba(0,0,0,0.3);
+    pointer-events: auto; touch-action: none;
+  }
+  #boost-btn.active { background: #fff; transform: scale(0.94); }
+  body.large-ui #boost-btn { width: 100px; height: 100px; }
+  body.large-ui #joystick-zone { width: 150px; height: 150px; }
+
+  /* pause-btn is a normal flex child of #hud (length | pause | rank), not absolutely
+     positioned, so it can't drift on top of the rank box on odd screen sizes */
+
+  #sr-announcer { position: absolute; }
+
+  /* BOOT / SPLASH SCREEN */
+  #screen-boot {
+    background: radial-gradient(circle at 50% 32%, #2B1B54 0%, #0B061F 75%);
+    cursor: pointer;
+  }
+  .boot-presents {
+    font-family: var(--display-font); font-weight: 800; font-size: 0.72rem;
+    letter-spacing: 2.5px; opacity: 0.5; margin-bottom: 0.6rem;
+  }
+  #bootCanvas { width: 190px; height: 190px; }
+  .boot-subtitle {
+    font-family: var(--display-font); font-weight: 800; font-size: 1.05rem;
+    color: var(--accent-2); margin: 0.2rem 0 1.6rem; text-align: center;
+  }
+  .boot-bar-track {
+    width: 210px; height: 16px; background: rgba(255,255,255,0.12);
+    border-radius: 10px; overflow: hidden; margin-bottom: 0.9rem;
+  }
+  .boot-bar-fill {
+    height: 100%; width: 0%; background: linear-gradient(90deg, var(--accent), var(--accent-2));
+    border-radius: 10px;
+  }
+  .boot-skip { font-size: 0.72rem; opacity: 0.4; }
+
+  .main-subtitle {
+    font-family: var(--display-font); font-weight: 800; font-size: 1rem;
+    color: var(--accent-2); margin: -0.4rem 0 2rem; text-align: center;
+  }
+</style>
+</head>
+<body>
+<div id="app">
+
+  <!-- aria-live region for screen-reader announcements (rank changes, eliminations) -->
+  <div id="sr-announcer" class="visually-hidden" aria-live="polite"></div>
+
+  <div id="screen-boot" class="screen">
+    <div class="boot-presents">BKAOS PRESENTS</div>
+    <canvas id="bootCanvas" width="190" height="190" aria-hidden="true"></canvas>
+    <div class="logo-text" style="font-size:2.4rem; margin-top:0.4rem; margin-bottom:0.2rem;">DRAGGY</div>
+    <div class="boot-subtitle">GOBBLE, GIGGLE, GROW!</div>
+    <div class="boot-bar-track"><div class="boot-bar-fill" id="boot-bar-fill"></div></div>
+    <div class="boot-skip">tap to skip</div>
+  </div>
+
+  <div id="screen-main" class="screen hidden">
+    <div class="logo-text">DRAGGY</div>
+    <div class="main-subtitle">GOBBLE, GIGGLE, GROW!</div>
+    <button class="btn" id="btn-play">💥 ENTER ARENA</button>
+    <button class="btn secondary" id="btn-open-settings">⚙️ SETTINGS</button>
+  </div>
+
+  <div id="screen-settings" class="screen hidden">
+    <div class="logo-text" style="font-size:1.8rem;">SETTINGS</div>
+
+    <div class="panel-card">
+      <div class="setting-row">
+        <div class="label-group">
+          <span class="title">Colorblind-safe palette</span>
+          <span class="desc">Distinct hues + shape badges so dragons never rely on color alone</span>
+        </div>
+        <label class="switch"><input type="checkbox" id="set-cbsafe"><span class="track"></span></label>
+      </div>
+      <div class="setting-row">
+        <div class="label-group">
+          <span class="title">High contrast</span>
+          <span class="desc">Stronger outlines and a solid HUD background</span>
+        </div>
+        <label class="switch"><input type="checkbox" id="set-contrast"><span class="track"></span></label>
+      </div>
+      <div class="setting-row">
+        <div class="label-group">
+          <span class="title">Reduce motion</span>
+          <span class="desc">Calms screen shake, glow pulses, and trail flicker</span>
+        </div>
+        <label class="switch"><input type="checkbox" id="set-motion"><span class="track"></span></label>
+      </div>
+      <div class="setting-row">
+        <div class="label-group">
+          <span class="title">Large UI</span>
+          <span class="desc">Bigger HUD text and bigger touch targets</span>
+        </div>
+        <label class="switch"><input type="checkbox" id="set-largeui"><span class="track"></span></label>
+      </div>
+      <div class="setting-row">
+        <div class="label-group">
+          <span class="title">Sound</span>
+        </div>
+        <label class="switch"><input type="checkbox" id="set-sound"><span class="track"></span></label>
+      </div>
+      <div class="setting-row">
+        <div class="label-group">
+          <span class="title">Haptics</span>
+          <span class="desc">Vibration on eat / kill, where supported</span>
+        </div>
+        <label class="switch"><input type="checkbox" id="set-haptics"><span class="track"></span></label>
+      </div>
+      <div class="setting-row">
+        <div class="label-group">
+          <span class="title">Controls</span>
+          <span class="desc">Drag anywhere, or a fixed joystick you can rest a thumb on</span>
+        </div>
+        <div class="segmented" id="set-controlscheme">
+          <button data-val="drag">Drag</button>
+          <button data-val="joystick">Joystick</button>
+        </div>
+      </div>
+      <div class="setting-row">
+        <div class="label-group">
+          <span class="title">Boost button</span>
+          <span class="desc">Hold to boost, or tap once to toggle it on/off</span>
+        </div>
+        <div class="segmented" id="set-boostmode">
+          <button data-val="hold">Hold</button>
+          <button data-val="toggle">Tap</button>
+        </div>
+      </div>
+      <div class="setting-row">
+        <div class="label-group">
+          <span class="title">Minimap</span>
+        </div>
+        <label class="switch"><input type="checkbox" id="set-minimap"><span class="track"></span></label>
+      </div>
+    </div>
+
+    <button class="btn" id="btn-close-settings">DONE</button>
+    <div style="font-size:0.72rem; opacity:0.5; max-width:320px; text-align:center; margin-top:0.5rem;">
+      Nothing here ever leaves your device — no analytics, no ads, no account. Settings reset when this tab/app fully restarts.
+    </div>
+    <div style="font-size:0.65rem; opacity:0.32; margin-top:0.5rem;">Draggy is made by BKAOS</div>
+  </div>
+
+  <div id="screen-game" class="screen hidden" style="padding:0;">
+    <div id="hud">
+      <div class="hud-box">
+        <span class="label">LENGTH</span>
+        <span class="value" id="score-val">0</span>
+      </div>
+      <button class="icon-btn" id="pause-btn" aria-label="Pause game">⏸</button>
+      <div class="hud-box" style="text-align: right;">
+        <span class="label">ARENA RANK</span>
+        <span class="value" id="rank-val">1 / 5</span>
+      </div>
+    </div>
+    <canvas id="gameCanvas"></canvas>
+    <div id="controls-layer">
+      <div id="joystick-zone" aria-hidden="true">
+        <div id="joystick-knob"></div>
+      </div>
+      <button id="boost-btn" aria-label="Boost">BOOST</button>
+    </div>
+  </div>
+
+  <div id="screen-pause" class="screen hidden" style="background: rgba(11,6,31,0.9); backdrop-filter: blur(6px);">
+    <div class="logo-text" style="font-size: 2.2rem;">PAUSED</div>
+    <button class="btn" id="btn-resume">▶️ RESUME</button>
+    <button class="btn secondary" id="btn-pause-settings">⚙️ SETTINGS</button>
+    <button class="btn ghost" id="btn-pause-menu">QUIT TO MENU</button>
+  </div>
+
+  <div id="screen-gameover" class="screen hidden" style="background: rgba(11,6,31,0.85); backdrop-filter: blur(6px);">
+    <div class="logo-text" style="font-size: 2.4rem; color: var(--accent);">OOPS!</div>
+    <div style="font-family: var(--display-font); font-size: 1.05rem; opacity:0.85; margin-bottom: 0.6rem;">Draggy needs a little nap.</div>
+    <div style="font-family: var(--display-font); font-size: 1.4rem; margin-bottom: 2rem;">Final Length: <span id="final-score" style="color:var(--accent-2); font-weight:800;">0</span></div>
+    <button class="btn" id="btn-retry">🔁 TRY AGAIN</button>
+    <button class="btn secondary" id="btn-gameover-menu">🏠 MENU</button>
+  </div>
+
+</div>
+
+<script>
+'use strict';
+
+/* =========================================================
+   STORAGE ADAPTER — local-only, in-memory by default.
+   No network calls, no device identifiers, nothing tracked.
+   To persist across launches in the native shell, replace the
+   two methods below with Capacitor Preferences / UserDefaults
+   calls (or localStorage, if you're not running inside an
+   environment that blocks it).
+   ========================================================= */
+const Storage = {
+  _mem: {},
+  get(key, fallback) { return key in this._mem ? this._mem[key] : fallback; },
+  set(key, value) { this._mem[key] = value; }
+};
+
+/* =========================================================
+   SETTINGS — accessibility + control preferences
+   ========================================================= */
+const Settings = {
+  data: Storage.get('settings', {
+    colorblindSafe: false,
+    highContrast: false,
+    reduceMotion: window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches,
+    largeUI: false,
+    sound: true,
+    haptics: true,
+    controlScheme: 'drag',   // 'drag' | 'joystick'
+    boostMode: 'hold',       // 'hold' | 'toggle'
+    minimap: true
+  }),
+  save() { Storage.set('settings', this.data); },
+  apply() {
+    document.body.classList.toggle('high-contrast', this.data.highContrast);
+    document.body.classList.toggle('large-ui', this.data.largeUI);
+    document.documentElement.style.setProperty('--ui-scale', this.data.largeUI ? '1.18' : '1');
+    document.getElementById('joystick-zone').classList.toggle('hidden', this.data.controlScheme !== 'joystick');
+  }
+};
+
+const PALETTES = {
+  normal: { player: '#FF595E', bots: ['#FFCA3A', '#8AC926', '#1982C4', '#9B5DE5', '#FF924C', '#52B788'] },
+  // Okabe-Ito colorblind-safe set
+  safe: { player: '#D55E00', bots: ['#E69F00', '#56B4E9', '#009E73', '#F0E442', '#0072B2', '#CC79A7'] }
+};
+function currentPalette() { return Settings.data.colorblindSafe ? PALETTES.safe : PALETTES.normal; }
+
+/* =========================================================
+   SOUND + HAPTICS
+   ========================================================= */
+const sound = {
+  ctx: null,
+  ensure() { if (!this.ctx) this.ctx = new (window.AudioContext || window.webkitAudioContext)(); },
+  tone(freq, dur, type = 'sine', vol = 0.15, glide = null) {
+    if (!Settings.data.sound) return;
+    try {
+      this.ensure();
+      const osc = this.ctx.createOscillator();
+      const gain = this.ctx.createGain();
+      osc.type = type;
+      osc.frequency.setValueAtTime(freq, this.ctx.currentTime);
+      if (glide) osc.frequency.exponentialRampToValueAtTime(glide, this.ctx.currentTime + dur);
+      gain.gain.setValueAtTime(vol, this.ctx.currentTime);
+      gain.gain.exponentialRampToValueAtTime(0.001, this.ctx.currentTime + dur);
+      osc.connect(gain); gain.connect(this.ctx.destination);
+      osc.start(); osc.stop(this.ctx.currentTime + dur);
+    } catch (e) {}
+  },
+  eat() { this.tone(450, 0.08, 'sine', 0.12, 600); },
+  bounty() { this.tone(620, 0.12, 'triangle', 0.14, 900); },
+  kill() { this.tone(200, 0.25, 'sawtooth', 0.15, 850); },
+  death() { this.tone(300, 0.4, 'triangle', 0.2, 80); },
+  boostStart() { this.tone(150, 0.15, 'square', 0.08, 320); }
+};
+
+const haptics = {
+  buzz(ms) {
+    if (!Settings.data.haptics) return;
+    try { if (navigator.vibrate) navigator.vibrate(ms); } catch (e) {}
+  }
+};
+
+function announce(text) {
+  const el = document.getElementById('sr-announcer');
+  el.textContent = '';
+  requestAnimationFrame(() => { el.textContent = text; });
+}
+
+/* =========================================================
+   INPUT MANAGER — abstracts drag-anywhere vs fixed joystick
+   vs keyboard, so dragon controllers don't care which one is active.
+   ========================================================= */
+const InputManager = {
+  angle: 0,
+  hasDirection: false,
+  boosting: false,
+  _dragOrigin: null,
+  _dragCurrent: null,
+  _joystickActive: false,
+  _keys: { up: false, down: false, left: false, right: false },
+
+  init(canvas) {
+    const zone = document.getElementById('joystick-zone');
+    const knob = document.getElementById('joystick-knob');
+    const boostBtn = document.getElementById('boost-btn');
+
+    const setFromVector = (dx, dy, maxR) => {
+      const dist = Math.hypot(dx, dy);
+      if (dist > 6) { this.angle = Math.atan2(dy, dx); this.hasDirection = true; }
+      const clamped = Math.min(dist, maxR);
+      const a = Math.atan2(dy, dx);
+      knob.style.transform = `translate(${Math.cos(a) * clamped}px, ${Math.sin(a) * clamped}px)`;
+    };
+
+    // Drag-anywhere scheme (full canvas)
+    canvas.addEventListener('pointerdown', e => {
+      if (Settings.data.controlScheme !== 'drag') return;
+      this._dragOrigin = { x: e.clientX, y: e.clientY };
+    });
+    canvas.addEventListener('pointermove', e => {
+      if (Settings.data.controlScheme !== 'drag' || !this._dragOrigin) return;
+      setFromVector(e.clientX - this._dragOrigin.x, e.clientY - this._dragOrigin.y, 9999);
+    });
+    window.addEventListener('pointerup', () => {
+      this._dragOrigin = null;
+      if (Settings.data.controlScheme === 'drag') knob.style.transform = 'translate(0,0)';
+    });
+
+    // Fixed joystick scheme
+    zone.addEventListener('pointerdown', e => {
+      this._joystickActive = true;
+      zone.setPointerCapture && zone.setPointerCapture(e.pointerId);
+    });
+    zone.addEventListener('pointermove', e => {
+      if (!this._joystickActive) return;
+      const rect = zone.getBoundingClientRect();
+      const cx = rect.left + rect.width / 2, cy = rect.top + rect.height / 2;
+      setFromVector(e.clientX - cx, e.clientY - cy, rect.width / 2 - 20);
+    });
+    const releaseJoystick = () => { this._joystickActive = false; knob.style.transform = 'translate(0,0)'; };
+    zone.addEventListener('pointerup', releaseJoystick);
+    zone.addEventListener('pointercancel', releaseJoystick);
+
+    // Boost button (hold or toggle)
+    boostBtn.addEventListener('pointerdown', () => {
+      if (Settings.data.boostMode === 'toggle') {
+        this.boosting = !this.boosting;
+        boostBtn.classList.toggle('active', this.boosting);
+      } else {
+        this.boosting = true;
+        boostBtn.classList.add('active');
+      }
+    });
+    boostBtn.addEventListener('pointerup', () => {
+      if (Settings.data.boostMode === 'hold') { this.boosting = false; boostBtn.classList.remove('active'); }
+    });
+    boostBtn.addEventListener('pointercancel', () => {
+      if (Settings.data.boostMode === 'hold') { this.boosting = false; boostBtn.classList.remove('active'); }
+    });
+
+    // Keyboard fallback (external keyboards, switch-access emulation)
+    window.addEventListener('keydown', e => {
+      if (e.key === 'ArrowUp' || e.key === 'w') this._keys.up = true;
+      if (e.key === 'ArrowDown' || e.key === 's') this._keys.down = true;
+      if (e.key === 'ArrowLeft' || e.key === 'a') this._keys.left = true;
+      if (e.key === 'ArrowRight' || e.key === 'd') this._keys.right = true;
+      if (e.key === ' ') this.boosting = true;
+    });
+    window.addEventListener('keyup', e => {
+      if (e.key === 'ArrowUp' || e.key === 'w') this._keys.up = false;
+      if (e.key === 'ArrowDown' || e.key === 's') this._keys.down = false;
+      if (e.key === 'ArrowLeft' || e.key === 'a') this._keys.left = false;
+      if (e.key === 'ArrowRight' || e.key === 'd') this._keys.right = false;
+      if (e.key === ' ') this.boosting = false;
+    });
+  },
+
+  poll() {
+    const k = this._keys;
+    if (k.up || k.down || k.left || k.right) {
+      const dx = (k.right ? 1 : 0) - (k.left ? 1 : 0);
+      const dy = (k.down ? 1 : 0) - (k.up ? 1 : 0);
+      this.angle = Math.atan2(dy, dx);
+      this.hasDirection = true;
+    }
+    return { angle: this.angle, hasDirection: this.hasDirection, boosting: this.boosting };
+  }
+};
+
+/* =========================================================
+   MODULE B — DRAGON CONTROLLER (base + Player + AI)
+   ========================================================= */
+const SHAPE_COUNT = 6;
+
+function shadeColor(hex, percent) {
+  const num = parseInt(hex.slice(1), 16);
+  let r = (num >> 16) + Math.round(2.55 * percent);
+  let g = ((num >> 8) & 0xff) + Math.round(2.55 * percent);
+  let b = (num & 0xff) + Math.round(2.55 * percent);
+  r = Math.max(0, Math.min(255, r)); g = Math.max(0, Math.min(255, g)); b = Math.max(0, Math.min(255, b));
+  return `rgb(${r},${g},${b})`;
+}
+
+// Crest/horn silhouette = the colorblind-safe identity marker (replaces the old
+// floating badge icon — same purpose, but it now reads as anatomy, not UI chrome).
+// All six variants are built from one safe triangle primitive so none of them can
+// render as a broken/empty path.
+function drawCrest(ctx, crestId, s) {
+  const horn = (offY, length, width) => {
+    ctx.moveTo(-s * 0.6, offY - width);
+    ctx.lineTo(-s * 0.6 - length, offY);
+    ctx.lineTo(-s * 0.6, offY + width);
+  };
+  ctx.beginPath();
+  switch (crestId % SHAPE_COUNT) {
+    case 0: ctx.arc(-s * 0.78, 0, s * 0.15, 0, Math.PI * 2); break;                 // smooth hatchling nub
+    case 1: horn(0, s * 0.5, s * 0.12); break;                                       // single center horn
+    case 2: horn(-s * 0.38, s * 0.45, s * 0.1); horn(s * 0.38, s * 0.45, s * 0.1); break; // twin horns
+    case 3: horn(-s * 0.5, s * 0.3, s * 0.08); horn(0, s * 0.4, s * 0.08); horn(s * 0.5, s * 0.3, s * 0.08); break; // triple spikes
+    case 4: for (let i = -2; i <= 2; i++) horn(i * s * 0.22, s * 0.28, s * 0.07); break; // frill fan
+    default: horn(-s * 0.3, s * 0.65, s * 0.09); horn(s * 0.3, s * 0.65, s * 0.09);  // long swept horns
+  }
+  ctx.fill();
+}
+
+// Shared dragon-head renderer — used for every in-arena dragon AND for the
+// boot-screen hatchling, so Draggy looks like the same character everywhere.
+// Call after ctx.translate(x,y) + ctx.rotate(angle); draws facing local +x.
+function drawDragonHead(ctx, opts) {
+  const s = opts.size, color = opts.color, dark = shadeColor(color, -22);
+
+  if (opts.wingFlap !== null && opts.wingFlap !== undefined) {
+    ctx.fillStyle = dark;
+    ctx.globalAlpha = 0.85;
+    [1, -1].forEach(side => {
+      ctx.save();
+      ctx.translate(-s * 0.15, side * s * 0.5);
+      ctx.rotate(side * (0.55 + opts.wingFlap * 0.2));
+      ctx.beginPath();
+      ctx.moveTo(0, 0);
+      ctx.lineTo(-s * 1.1, side * s * 0.55);
+      ctx.lineTo(-s * 0.35, side * s * 0.15);
+      ctx.closePath();
+      ctx.fill();
+      ctx.restore();
+    });
+    ctx.globalAlpha = 1;
+  }
+
+  if (opts.boosting) {
+    ctx.fillStyle = '#FFCA3A';
+    ctx.beginPath();
+    ctx.moveTo(s * 1.05, -s * 0.16); ctx.lineTo(s * 1.65, 0); ctx.lineTo(s * 1.05, s * 0.16);
+    ctx.closePath(); ctx.fill();
+    ctx.fillStyle = '#FF924C';
+    ctx.beginPath();
+    ctx.moveTo(s * 1.05, -s * 0.08); ctx.lineTo(s * 1.35, 0); ctx.lineTo(s * 1.05, s * 0.08);
+    ctx.closePath(); ctx.fill();
+  }
+
+  ctx.fillStyle = dark;
+  drawCrest(ctx, opts.crestId || 0, s);
+
+  ctx.fillStyle = color;
+  if (opts.highContrast) { ctx.strokeStyle = '#000'; ctx.lineWidth = 2; }
+  ctx.beginPath(); ctx.arc(0, 0, s, 0, Math.PI * 2); ctx.fill();
+  if (opts.highContrast) ctx.stroke();
+  ctx.beginPath(); ctx.ellipse(s * 0.75, 0, s * 0.5, s * 0.38, 0, 0, Math.PI * 2); ctx.fill();
+  if (opts.highContrast) ctx.stroke();
+
+  ctx.fillStyle = 'rgba(0,0,0,0.4)';
+  ctx.beginPath(); ctx.arc(s * 1.05, -s * 0.12, s * 0.06, 0, Math.PI * 2); ctx.fill();
+  ctx.beginPath(); ctx.arc(s * 1.05, s * 0.12, s * 0.06, 0, Math.PI * 2); ctx.fill();
+
+  ctx.fillStyle = '#fff';
+  ctx.beginPath(); ctx.arc(s * 0.32, -s * 0.42, s * 0.26, 0, Math.PI * 2); ctx.fill();
+  ctx.beginPath(); ctx.arc(s * 0.32, s * 0.42, s * 0.26, 0, Math.PI * 2); ctx.fill();
+  ctx.fillStyle = '#1a1a1a';
+  ctx.beginPath(); ctx.arc(s * 0.41, -s * 0.42, s * 0.12, 0, Math.PI * 2); ctx.fill();
+  ctx.beginPath(); ctx.arc(s * 0.41, s * 0.42, s * 0.12, 0, Math.PI * 2); ctx.fill();
+  ctx.fillStyle = '#fff';
+  ctx.beginPath(); ctx.arc(s * 0.45, -s * 0.47, s * 0.045, 0, Math.PI * 2); ctx.fill();
+  ctx.beginPath(); ctx.arc(s * 0.45, s * 0.37, s * 0.045, 0, Math.PI * 2); ctx.fill();
+
+  ctx.strokeStyle = 'rgba(0,0,0,0.3)';
+  ctx.lineWidth = Math.max(1.2, s * 0.06);
+  ctx.beginPath(); ctx.arc(s * 0.6, 0, s * 0.3, -0.5, 0.5); ctx.stroke();
+}
+
+// Boot-screen-only helper: a simple rounded egg silhouette.
+function drawEggPath(ctx, cx, cy, w, h) {
+  ctx.beginPath();
+  ctx.moveTo(cx, cy - h);
+  ctx.bezierCurveTo(cx + w, cy - h * 0.6, cx + w, cy + h * 0.55, cx, cy + h);
+  ctx.bezierCurveTo(cx - w, cy + h * 0.55, cx - w, cy - h * 0.6, cx, cy - h);
+  ctx.closePath();
+}
+
+class DragonController {
+  constructor(opts) {
+    this.id = opts.id;
+    this.isBot = !!opts.isBot;
+    this.x = opts.x; this.y = opts.y;
+    this.angle = opts.angle || 0;
+    this.targetAngle = this.angle;
+    this.baseSpeed = opts.baseSpeed;
+    this.boostSpeed = opts.boostSpeed;
+    this.speed = this.baseSpeed;
+    this.size = opts.size;
+    this.color = opts.color;
+    this.shapeId = opts.shapeId || 0;
+    this.segments = opts.segments;
+    this.minSegments = 8;
+    this.history = [];          // raw recorded path, newest first
+    this.bodyPoints = [];       // arc-length-resampled points, recomputed once per frame
+    this.alive = true;
+    this.boosting = false;
+    this._boostClock = 0;
+    this._wingSeed = Math.random() * 10;
+  }
+
+  turnTo(angle, dt, turnRate) {
+    let diff = angle - this.angle;
+    while (diff < -Math.PI) diff += Math.PI * 2;
+    while (diff > Math.PI) diff -= Math.PI * 2;
+    this.angle += diff * Math.min(1, turnRate * dt);
+  }
+
+  setBoost(active) { this.boosting = !!active && this.segments > this.minSegments; }
+
+  // MODULE C — Segment Follower: resample the raw history at even arc-length
+  // intervals so segments stay evenly spaced regardless of how fast the head
+  // was moving when each history point was recorded (this is what keeps the
+  // tail from gapping during boost or overlapping when turning sharply).
+  resampleBody(spacing) {
+    const pts = this.bodyPoints;
+    pts.length = 0;
+    if (this.history.length === 0) return;
+    let target = spacing, acc = 0, prev = this.history[0];
+    pts.push({ x: prev.x, y: prev.y });
+    for (let i = 1; i < this.history.length && pts.length < this.segments; i++) {
+      const cur = this.history[i];
+      const segDist = Math.hypot(cur.x - prev.x, cur.y - prev.y);
+      acc += segDist;
+      while (acc >= target && pts.length < this.segments) {
+        const overshoot = acc - target;
+        const t = segDist > 0 ? 1 - overshoot / segDist : 1;
+        pts.push({ x: prev.x + (cur.x - prev.x) * t, y: prev.y + (cur.y - prev.y) * t });
+        target += spacing;
+      }
+      prev = cur;
+    }
+  }
+
+  step(dt, world, onBoostPulse) {
+    this.speed = this.boosting ? this.boostSpeed : this.baseSpeed;
+    this.x += Math.cos(this.angle) * this.speed * dt;
+    this.y += Math.sin(this.angle) * this.speed * dt;
+    this.x = Math.max(this.size, Math.min(world.size - this.size, this.x));
+    this.y = Math.max(this.size, Math.min(world.size - this.size, this.y));
+
+    this.history.unshift({ x: this.x, y: this.y });
+    const maxHistory = (this.segments + 6) * 9;
+    if (this.history.length > maxHistory) this.history.length = maxHistory;
+
+    if (this.boosting) {
+      this._boostClock += dt;
+      if (this._boostClock > 9) {
+        this._boostClock = 0;
+        if (this.segments > this.minSegments) {
+          this.segments -= 1;
+          const tail = this.history[this.history.length - 1] || this;
+          if (onBoostPulse) onBoostPulse(tail.x, tail.y);
+        } else {
+          this.boosting = false;
+        }
+      }
+    }
+
+    this.resampleBody(this.size * 0.62);
+  }
+}
+
+class PlayerDragonController extends DragonController {
+  update(dt, world, input, onBoostPulse) {
+    if (input.hasDirection) this.turnTo(input.angle, dt, 0.2);
+    this.setBoost(input.boosting);
+    this.step(dt, world, onBoostPulse);
+  }
+}
+
+class AIDragonController extends DragonController {
+  constructor(opts) { super(opts); this.nextDecision = 0; this.wanderAngle = this.angle; }
+  update(dt, world, essencePool) {
+    const now = performance.now();
+    let nearest = null, nd = Infinity;
+    for (const e of essencePool.pool) {
+      if (!e.active) continue;
+      const d = Math.hypot(e.x - this.x, e.y - this.y);
+      if (d < 260 && d < nd) { nd = d; nearest = e; }
+    }
+    if (nearest) {
+      this.targetAngle = Math.atan2(nearest.y - this.y, nearest.x - this.x);
+    } else if (now > this.nextDecision) {
+      this.wanderAngle += (Math.random() - 0.5) * 1.4;
+      this.targetAngle = this.wanderAngle;
+      this.nextDecision = now + 500 + Math.random() * 800;
+    }
+    const margin = 180;
+    if (this.x < margin) this.targetAngle = 0;
+    else if (this.x > world.size - margin) this.targetAngle = Math.PI;
+    if (this.y < margin) this.targetAngle = Math.PI / 2;
+    else if (this.y > world.size - margin) this.targetAngle = -Math.PI / 2;
+
+    this.turnTo(this.targetAngle, dt, 0.12);
+    this.setBoost(false);
+    this.step(dt, world);
+  }
+}
+
+/* =========================================================
+   MODULE D — ESSENCE POOL (object pooling) + COLLISION SYSTEM
+   ========================================================= */
+class EssencePool {
+  constructor(world, target) { this.world = world; this.target = target; this.pool = []; }
+  spawn(x, y, value, bountyFor) {
+    let e = this.pool.find(p => !p.active);
+    if (!e) { e = { x: 0, y: 0, size: 4, hue: 0, value: 1, bountyFor: null, active: false }; this.pool.push(e); }
+    e.x = x !== undefined ? x : Math.random() * this.world.size;
+    e.y = y !== undefined ? y : Math.random() * this.world.size;
+    e.size = bountyFor ? 7 : 4;
+    e.hue = Math.random() * 360;
+    e.value = value || 1;
+    e.bountyFor = bountyFor || null;
+    e.active = true;
+    return e;
+  }
+  replenish() {
+    const activeCount = this.pool.reduce((n, p) => n + (p.active ? 1 : 0), 0);
+    if (activeCount < this.target) this.spawn();
+  }
+  updateBounties(dt, dragons) {
+    for (const e of this.pool) {
+      if (!e.active || !e.bountyFor) continue;
+      const target = dragons.find(d => d.id === e.bountyFor && d.alive);
+      if (!target) { e.bountyFor = null; continue; }
+      const dist = Math.hypot(target.x - e.x, target.y - e.y);
+      if (dist < 240) {
+        const pull = Math.min(1, dt * 0.2);
+        e.x += (target.x - e.x) * pull;
+        e.y += (target.y - e.y) * pull;
+      }
+    }
+  }
+}
+
+const CollisionSystem = {
+  // Essence absorption: any dragon head close enough to an active orb eats it.
+  checkEssence(dragons, pool, onEat) {
+    for (const d of dragons) {
+      if (!d.alive) continue;
+      for (const e of pool.pool) {
+        if (!e.active) continue;
+        if (Math.hypot(d.x - e.x, d.y - e.y) < d.size + e.size) {
+          d.segments += e.value;
+          const wasBounty = !!e.bountyFor;
+          e.active = false;
+          onEat(d, wasBounty);
+        }
+      }
+    }
+  },
+  // Head-vs-tail: skip the first few body points of the target so a dragon
+  // can't "bite itself" or instantly die touching a tail right behind a head.
+  checkHeadVsTail(dragons, onDeath) {
+    dragonLoop:
+    for (const dragon of dragons) {
+      if (!dragon.alive) continue;
+      for (const target of dragons) {
+        if (target.id === dragon.id || !target.alive) continue;
+        for (let s = 3; s < target.bodyPoints.length; s++) {
+          const pos = target.bodyPoints[s];
+          if (Math.hypot(dragon.x - pos.x, dragon.y - pos.y) < dragon.size + 6) {
+            onDeath(dragon, target);
+            continue dragonLoop; // this dragon is dead — move to the next dragon, don't abort everyone else's check
+          }
+        }
+      }
+    }
+  }
+};
+
+/* =========================================================
+   MODULE A — STATE MANAGER
+   ========================================================= */
+const StateManager = {
+  current: 'boot',
+  previous: 'boot',
+  show(id) {
+    this.previous = this.current;
+    this.current = id;
+    document.querySelectorAll('.screen').forEach(s => s.classList.add('hidden'));
+    document.getElementById('screen-' + id).classList.remove('hidden');
+  },
+  back() { this.show(this.previous === this.current ? 'main' : this.previous); }
+};
+
+/* =========================================================
+   ARENA ENGINE — composition root that wires the modules together
+   ========================================================= */
+class ArenaEngine {
+  constructor() {
+    this.canvas = document.getElementById('gameCanvas');
+    this.ctx = this.canvas.getContext('2d');
+    this.world = { size: 2600 };
+    this.paused = false;
+    window.addEventListener('resize', () => this.resize());
+    InputManager.init(this.canvas);
+    this.resize();
+  }
+
+  resize() { this.canvas.width = window.innerWidth; this.canvas.height = window.innerHeight; }
+
+  start() {
+    StateManager.show('game');
+    const palette = currentPalette();
+
+    this.player = new PlayerDragonController({
+      id: 'player', x: this.world.size / 2, y: this.world.size / 2,
+      baseSpeed: 3.6, boostSpeed: 6.4, size: 16, color: palette.player, shapeId: 0, segments: 16
+    });
+
+    this.dragons = [this.player];
+    for (let i = 0; i < 6; i++) {
+      this.dragons.push(new AIDragonController({
+        id: 'bot_' + i + '_' + Date.now(),
+        x: Math.random() * (this.world.size - 200) + 100,
+        y: Math.random() * (this.world.size - 200) + 100,
+        angle: Math.random() * Math.PI * 2,
+        baseSpeed: 3.0, boostSpeed: 3.0, size: 15,
+        color: palette.bots[i % palette.bots.length], shapeId: i + 1,
+        segments: Math.floor(Math.random() * 15) + 15
+      }));
+    }
+
+    this.essence = new EssencePool(this.world, 160);
+    for (let i = 0; i < 160; i++) this.essence.replenish();
+
+    this.isGameOver = false;
+    this.paused = false;
+    this.lastTime = performance.now();
+    cancelAnimationFrame(this.rafId);
+    this.rafId = requestAnimationFrame(t => this.loop(t));
+  }
+
+  pause() { this.paused = true; StateManager.show('pause'); }
+  resume() { this.paused = false; StateManager.show('game'); this.lastTime = performance.now(); }
+
+  loop(t) {
+    if (this.isGameOver) return;
+    if (this.paused) { this.rafId = requestAnimationFrame(t2 => this.loop(t2)); return; }
+    const dt = Math.min(3, (t - this.lastTime) / 16.66);
+    this.lastTime = t;
+    this.update(dt);
+    this.draw();
+    this.rafId = requestAnimationFrame(t2 => this.loop(t2));
+  }
+
+  update(dt) {
+    const input = InputManager.poll();
+    const onBoostPulse = (x, y) => this.essence.spawn(x, y, 1, null);
+
+    for (const d of this.dragons) {
+      if (!d.alive) continue;
+      if (d === this.player) d.update(dt, this.world, input, onBoostPulse);
+      else d.update(dt, this.world, this.essence);
+    }
+
+    this.essence.replenish();
+    this.essence.updateBounties(dt, this.dragons);
+
+    CollisionSystem.checkEssence(this.dragons, this.essence, (dragon, wasBounty) => {
+      if (dragon === this.player) { sound.eat(); if (wasBounty) { sound.bounty(); haptics.buzz(15); } }
+    });
+
+    CollisionSystem.checkHeadVsTail(this.dragons, (dragon, killer) => this.eliminate(dragon, killer));
+
+    document.getElementById('score-val').textContent = this.player.alive ? this.player.segments : '0';
+    const sorted = [...this.dragons].filter(d => d.alive).sort((a, b) => b.segments - a.segments);
+    const rank = sorted.findIndex(d => d.id === 'player') + 1;
+    document.getElementById('rank-val').textContent = rank + ' / ' + sorted.length;
+  }
+
+  eliminate(dragon, killer) {
+    dragon.alive = false;
+    const dropPoints = dragon.bodyPoints.length ? dragon.bodyPoints : [{ x: dragon.x, y: dragon.y }];
+    dropPoints.forEach((pos, i) => {
+      const isBounty = killer && Math.random() < 0.4;
+      this.essence.spawn(
+        pos.x + (Math.random() - 0.5) * 14,
+        pos.y + (Math.random() - 0.5) * 14,
+        2,
+        isBounty ? killer.id : null
+      );
+    });
+
+    if (dragon === this.player) {
+      sound.death();
+      haptics.buzz([0, 60, 40, 60]);
+      this.isGameOver = true;
+      document.getElementById('final-score').textContent = dragon.segments;
+      announce('You were defeated. Final length ' + dragon.segments + '.');
+      StateManager.show('gameover');
+    } else {
+      sound.kill();
+      this.dragons = this.dragons.filter(d => d !== dragon);
+      setTimeout(() => {
+        if (this.isGameOver) return;
+        const palette = currentPalette();
+        this.dragons.push(new AIDragonController({
+          id: 'bot_' + Date.now(), x: Math.random() * this.world.size, y: Math.random() * this.world.size,
+          angle: Math.random() * Math.PI * 2, baseSpeed: 3.0, boostSpeed: 3.0, size: 15,
+          color: palette.bots[Math.floor(Math.random() * palette.bots.length)],
+          shapeId: Math.floor(Math.random() * SHAPE_COUNT), segments: 15
+        }));
+      }, 3000);
+    }
+  }
+
+  draw() {
+    const ctx = this.ctx;
+    const reduceMotion = Settings.data.reduceMotion;
+    const highContrast = Settings.data.highContrast;
+    ctx.clearRect(0, 0, this.canvas.width, this.canvas.height);
+
+    const camX = this.canvas.width / 2 - this.player.x;
+    const camY = this.canvas.height / 2 - this.player.y;
+    ctx.save();
+    ctx.translate(camX, camY);
+
+    ctx.fillStyle = '#0B061F';
+    ctx.fillRect(0, 0, this.world.size, this.world.size);
+    ctx.strokeStyle = highContrast ? 'rgba(255,255,255,0.4)' : 'rgba(255,255,255,0.05)';
+    ctx.lineWidth = 4;
+    ctx.strokeRect(0, 0, this.world.size, this.world.size);
+
+    for (const e of this.essence.pool) {
+      if (!e.active) continue;
+      ctx.globalAlpha = 1;
+      ctx.fillStyle = e.bountyFor ? '#FFD23F' : `hsl(${e.hue}, 100%, 75%)`;
+      ctx.beginPath();
+      ctx.arc(e.x, e.y, e.size, 0, Math.PI * 2);
+      ctx.fill();
+      if (e.bountyFor && !reduceMotion) {
+        ctx.strokeStyle = 'rgba(255,210,63,0.5)';
+        ctx.lineWidth = 2;
+        ctx.beginPath();
+        ctx.arc(e.x, e.y, e.size + 3, 0, Math.PI * 2);
+        ctx.stroke();
+      }
+    }
+
+    for (const d of this.dragons) {
+      if (!d.alive) continue;
+      for (let i = d.bodyPoints.length - 1; i >= 1; i--) {
+        const pos = d.bodyPoints[i];
+        const prevPos = d.bodyPoints[i - 1];
+        const r = d.size * (1 - (i / d.segments) * 0.5);
+        ctx.fillStyle = d.color;
+        ctx.globalAlpha = 1 - (i / d.segments) * 0.35;
+        ctx.beginPath();
+        ctx.arc(pos.x, pos.y, r, 0, Math.PI * 2);
+        ctx.fill();
+
+        const dx = prevPos.x - pos.x, dy = prevPos.y - pos.y;
+        const len = Math.hypot(dx, dy) || 1;
+        if (i === d.bodyPoints.length - 1) {
+          // tail fin flourish at the very tip
+          const tx = -dx / len, ty = -dy / len; // pointing away from the body, out past the tip
+          const px = -ty, py = tx;
+          ctx.fillStyle = d.color;
+          ctx.beginPath();
+          ctx.moveTo(pos.x + px * r * 1.3, pos.y + py * r * 1.3);
+          ctx.lineTo(pos.x + tx * r * 1.5, pos.y + ty * r * 1.5);
+          ctx.lineTo(pos.x - px * r * 1.3, pos.y - py * r * 1.3);
+          ctx.closePath();
+          ctx.fill();
+        } else if (i % 3 === 0) {
+          // dorsal spike ridge, every third scale
+          const tx = dx / len, ty = dy / len;
+          const px = -ty, py = tx;
+          const w = r * 0.45, h = r * 0.85;
+          ctx.fillStyle = highContrast ? '#000' : 'rgba(255,255,255,0.5)';
+          ctx.beginPath();
+          ctx.moveTo(pos.x - tx * w, pos.y - ty * w);
+          ctx.lineTo(pos.x + px * h, pos.y + py * h);
+          ctx.lineTo(pos.x + tx * w, pos.y + ty * w);
+          ctx.closePath();
+          ctx.fill();
+        }
+      }
+      ctx.globalAlpha = 1.0;
+
+      ctx.save();
+      ctx.translate(d.x, d.y);
+      ctx.rotate(d.angle);
+      const flap = reduceMotion ? 0 : Math.sin(performance.now() / 220 + d._wingSeed);
+      drawDragonHead(ctx, {
+        size: d.size, color: d.color, crestId: d.shapeId,
+        boosting: d.boosting, highContrast, wingFlap: flap
+      });
+      ctx.restore();
+    }
+
+    ctx.restore();
+
+    if (Settings.data.minimap) this.drawMinimap();
+  }
+
+  drawMinimap() {
+    const ctx = this.ctx;
+    const mmSize = 110, pad = 14;
+    const x0 = this.canvas.width - mmSize - pad, y0 = pad + 70;
+    ctx.save();
+    ctx.fillStyle = 'rgba(0,0,0,0.45)';
+    ctx.fillRect(x0, y0, mmSize, mmSize);
+    ctx.strokeStyle = 'rgba(255,255,255,0.3)';
+    ctx.strokeRect(x0, y0, mmSize, mmSize);
+    const scale = mmSize / this.world.size;
+    for (const d of this.dragons) {
+      if (!d.alive) continue;
+      ctx.fillStyle = d === this.player ? '#fff' : d.color;
+      ctx.beginPath();
+      ctx.arc(x0 + d.x * scale, y0 + d.y * scale, d === this.player ? 3.5 : 2.5, 0, Math.PI * 2);
+      ctx.fill();
+    }
+    ctx.restore();
+  }
+}
+
+/* =========================================================
+   BOOT SEQUENCE — purely cosmetic branding beat (nothing in this
+   file actually needs to "load"). Draws an egg that cracks open
+   as the bar fills, then Draggy pops out with a little flame puff.
+   Tap anywhere to skip — never force anyone to sit through it.
+   ========================================================= */
+const BootSequence = {
+  duration: 2200,
+  startTime: 0,
+  progress: 0,
+  hatched: false,
+  hatchStart: 0,
+  skipped: false,
+  ctx: null,
+  cracks: [
+    [[-34, -58], [-12, -30], [-28, -4], [2, 22]],
+    [[36, -50], [14, -22], [30, 4], [4, 30]],
+    [[-16, 56], [6, 30], [-10, 8], [16, -18]]
+  ],
+  sparkles: [],
+
+  init() {
+    const canvas = document.getElementById('bootCanvas');
+    this.ctx = canvas.getContext('2d');
+    document.getElementById('screen-boot').addEventListener('pointerdown', () => this.skip());
+    for (let i = 0; i < 14; i++) {
+      this.sparkles.push({ a: Math.random() * Math.PI * 2, r: 28 + Math.random() * 48, size: 2 + Math.random() * 2.5 });
+    }
+  },
+
+  start() {
+    this.startTime = performance.now();
+    this.progress = 0;
+    this.hatched = false;
+    this.skipped = false;
+    requestAnimationFrame(t => this.loop(t));
+  },
+
+  skip() {
+    if (this.skipped || this.progress < 1) { this.skipped = true; this.finish(); }
+  },
+
+  loop(t) {
+    if (this.skipped) return;
+    const elapsed = t - this.startTime;
+    this.progress = Math.min(1, elapsed / this.duration);
+    document.getElementById('boot-bar-fill').style.width = (this.progress * 100) + '%';
+
+    if (this.progress >= 1 && !this.hatched) {
+      this.hatched = true;
+      this.hatchStart = t;
+      sound.bounty();
+      haptics.buzz(20);
+    }
+
+    this.draw(t);
+
+    if (this.hatched && t - this.hatchStart > 900) { this.finish(); return; }
+    requestAnimationFrame(t2 => this.loop(t2));
+  },
+
+  finish() { StateManager.show('main'); },
+
+  draw(t) {
+    const ctx = this.ctx, cx = 95, cy = 100, reduceMotion = Settings.data.reduceMotion;
+    ctx.clearRect(0, 0, 190, 190);
+    const hatchT = this.hatched ? Math.min(1, (t - this.hatchStart) / 500) : 0;
+
+    if (hatchT < 1) {
+      ctx.globalAlpha = 1 - hatchT;
+      ctx.fillStyle = '#FFE8B5';
+      drawEggPath(ctx, cx, cy, 46, 58);
+      ctx.fill();
+      ctx.strokeStyle = 'rgba(0,0,0,0.15)';
+      ctx.lineWidth = 2;
+      ctx.stroke();
+      ctx.fillStyle = 'rgba(180,140,90,0.5)';
+      [[-16, -24], [14, -8], [-8, 16], [18, 22], [-20, 32]].forEach(([dx, dy]) => {
+        ctx.beginPath(); ctx.arc(cx + dx, cy + dy, 2.4, 0, Math.PI * 2); ctx.fill();
+      });
+      const crackCount = this.progress > 0.85 ? 3 : this.progress > 0.5 ? 2 : this.progress > 0.2 ? 1 : 0;
+      ctx.strokeStyle = 'rgba(60,40,20,0.7)';
+      ctx.lineWidth = 2.2;
+      for (let i = 0; i < crackCount; i++) {
+        const c = this.cracks[i];
+        ctx.beginPath();
+        ctx.moveTo(cx + c[0][0] * 0.8, cy + c[0][1] * 0.8);
+        for (let p = 1; p < c.length; p++) ctx.lineTo(cx + c[p][0] * 0.8, cy + c[p][1] * 0.8);
+        ctx.stroke();
+      }
+    }
+
+    if (hatchT > 0) {
+      ctx.globalAlpha = hatchT;
+      if (!reduceMotion) {
+        ctx.strokeStyle = '#FFCA3A';
+        ctx.lineWidth = 2;
+        this.sparkles.forEach(sp => {
+          const r1 = sp.r * hatchT, r2 = r1 + sp.size * 4;
+          ctx.beginPath();
+          ctx.moveTo(cx + Math.cos(sp.a) * r1, cy + Math.sin(sp.a) * r1);
+          ctx.lineTo(cx + Math.cos(sp.a) * r2, cy + Math.sin(sp.a) * r2);
+          ctx.stroke();
+        });
+      }
+      ctx.fillStyle = '#FFE8B5';
+      ctx.save(); ctx.translate(cx - 38, cy + 24); ctx.rotate(-0.5 - hatchT * 0.15);
+      ctx.beginPath(); ctx.moveTo(0, 0); ctx.lineTo(28, -8); ctx.lineTo(16, 15); ctx.closePath(); ctx.fill();
+      ctx.restore();
+      ctx.save(); ctx.translate(cx + 38, cy + 24); ctx.rotate(0.5 + hatchT * 0.15);
+      ctx.beginPath(); ctx.moveTo(0, 0); ctx.lineTo(-28, -8); ctx.lineTo(-16, 15); ctx.closePath(); ctx.fill();
+      ctx.restore();
+
+      ctx.save();
+      ctx.translate(cx, cy + 4);
+      ctx.rotate(-Math.PI / 2);
+      drawDragonHead(ctx, {
+        size: 24, color: currentPalette().player, crestId: 2,
+        boosting: !reduceMotion && hatchT > 0.55, highContrast: Settings.data.highContrast, wingFlap: null
+      });
+      ctx.restore();
+    }
+    ctx.globalAlpha = 1;
+  }
+};
+
+/* =========================================================
+   BOOTSTRAP — wire up settings UI and screen buttons
+   ========================================================= */
+function bindSettingsUI() {
+  const s = Settings.data;
+  document.getElementById('set-cbsafe').checked = s.colorblindSafe;
+  document.getElementById('set-contrast').checked = s.highContrast;
+  document.getElementById('set-motion').checked = s.reduceMotion;
+  document.getElementById('set-largeui').checked = s.largeUI;
+  document.getElementById('set-sound').checked = s.sound;
+  document.getElementById('set-haptics').checked = s.haptics;
+  document.getElementById('set-minimap').checked = s.minimap;
+
+  const syncSegmented = (id, key) => {
+    document.querySelectorAll('#' + id + ' button').forEach(btn => {
+      btn.classList.toggle('active', btn.dataset.val === s[key]);
+    });
+  };
+  syncSegmented('set-controlscheme', 'controlScheme');
+  syncSegmented('set-boostmode', 'boostMode');
+
+  document.getElementById('set-cbsafe').onchange = e => { s.colorblindSafe = e.target.checked; Settings.save(); };
+  document.getElementById('set-contrast').onchange = e => { s.highContrast = e.target.checked; Settings.apply(); Settings.save(); };
+  document.getElementById('set-motion').onchange = e => { s.reduceMotion = e.target.checked; Settings.save(); };
+  document.getElementById('set-largeui').onchange = e => { s.largeUI = e.target.checked; Settings.apply(); Settings.save(); };
+  document.getElementById('set-sound').onchange = e => { s.sound = e.target.checked; Settings.save(); };
+  document.getElementById('set-haptics').onchange = e => { s.haptics = e.target.checked; Settings.save(); };
+  document.getElementById('set-minimap').onchange = e => { s.minimap = e.target.checked; Settings.save(); };
+
+  document.querySelectorAll('#set-controlscheme button').forEach(btn => {
+    btn.onclick = () => { s.controlScheme = btn.dataset.val; Settings.apply(); Settings.save(); syncSegmented('set-controlscheme', 'controlScheme'); };
+  });
+  document.querySelectorAll('#set-boostmode button').forEach(btn => {
+    btn.onclick = () => { s.boostMode = btn.dataset.val; Settings.save(); syncSegmented('set-boostmode', 'boostMode'); };
+  });
+}
+
+const game = new ArenaEngine();
+Settings.apply();
+bindSettingsUI();
+BootSequence.init();
+BootSequence.start();
+
+document.getElementById('btn-play').onclick = () => game.start();
+document.getElementById('btn-retry').onclick = () => game.start();
+document.getElementById('btn-open-settings').onclick = () => StateManager.show('settings');
+document.getElementById('btn-close-settings').onclick = () => StateManager.back();
+document.getElementById('btn-gameover-menu').onclick = () => StateManager.show('main');
+document.getElementById('pause-btn').onclick = () => game.pause();
+document.getElementById('btn-resume').onclick = () => game.resume();
+document.getElementById('btn-pause-settings').onclick = () => StateManager.show('settings');
+document.getElementById('btn-pause-menu').onclick = () => { game.isGameOver = true; StateManager.show('main'); };
+
+// Register service worker for offline support + installability.
+// Wrapped defensively: if this file is opened via file:// (no HTTPS), SW
+// registration will silently fail rather than throwing — the game still works.
+if ('serviceWorker' in navigator) {
+  window.addEventListener('load', () => {
+    navigator.serviceWorker.register('sw.js').catch(() => {});
+  });
+}
+</script>
+</body>
+</html>
